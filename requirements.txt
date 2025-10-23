@@ -1,0 +1,3 @@
+jmxquery
+prometheus_client
+pyyaml
