@@ -67,7 +67,7 @@ class InternalMetrics:
 class Config:
     """Configuration class supporting both YAML and environment variables"""
     jmx_items: Dict[str, Any]
-    cluster_endpoint: str
+    cluster_endpoints: List[str]
     scrape_duration: int
     port: int
     scan_new_nodes_interval: int
@@ -86,21 +86,46 @@ class Config:
             with open(final_path) as f:
                 config_data = yaml.safe_load(f) or {}
 
-            cluster_endpoint = os.getenv('CASSANDRA_CLUSTER_ENDPOINT', config_data.get('cluster_endpoint'))
+            env_cluster_endpoints = os.getenv('CASSANDRA_CLUSTER_ENDPOINTS')
+            env_cluster_endpoint = os.getenv('CASSANDRA_CLUSTER_ENDPOINT')
+
+            if env_cluster_endpoints:
+                cluster_endpoints = [ip.strip() for ip in env_cluster_endpoints.split(',') if ip.strip()]
+            elif env_cluster_endpoint:
+                cluster_endpoints = [env_cluster_endpoint.strip()]
+            else:
+                cluster_endpoints_config = config_data.get('cluster_endpoints')
+                if cluster_endpoints_config:
+                    if isinstance(cluster_endpoints_config, str):
+                        cluster_endpoints = [cluster_endpoints_config.strip()] if cluster_endpoints_config.strip() else []
+                    elif isinstance(cluster_endpoints_config, list):
+                        cluster_endpoints = [str(ip).strip() for ip in cluster_endpoints_config if str(ip).strip()]
+                    else:
+                        raise ConfigError("cluster_endpoints must be a list or string if provided.")
+                else:
+                    legacy_endpoint = config_data.get('cluster_endpoint')
+                    if legacy_endpoint is not None:
+                        legacy_endpoint_str = str(legacy_endpoint).strip()
+                        cluster_endpoints = [legacy_endpoint_str] if legacy_endpoint_str else []
+                    else:
+                        cluster_endpoints = []
             scrape_duration = int(os.getenv('JMX_SCRAPE_DURATION', config_data.get('scrape_duration', 60)))
             port = int(os.getenv('JMX_EXPORTER_PORT', config_data.get('port', 9095)))
             scan_interval = int(os.getenv('NODE_SCAN_INTERVAL', config_data.get('scan_new_nodes_interval', 120)))
             jmx_port = int(os.getenv('JMX_PORT', config_data.get('jmx_port', 7199)))
             max_workers = int(os.getenv('MAX_WORKERS', config_data.get('max_workers', 20)))
 
-            if not cluster_endpoint:
-                raise ConfigError("cluster_endpoint is required in config file or as CASSANDRA_CLUSTER_ENDPOINT env var.")
+            if not cluster_endpoints:
+                raise ConfigError(
+                    "At least one cluster endpoint is required. Set cluster_endpoints in the config file "
+                    "or use the CASSANDRA_CLUSTER_ENDPOINTS (comma-separated) / CASSANDRA_CLUSTER_ENDPOINT env vars."
+                )
             if not config_data.get('jmx_items'):
                 raise ConfigError("jmx_items configuration is required in config file.")
 
             return cls(
                 jmx_items=config_data['jmx_items'],
-                cluster_endpoint=cluster_endpoint,
+                cluster_endpoints=cluster_endpoints,
                 scrape_duration=scrape_duration,
                 port=port,
                 scan_new_nodes_interval=scan_interval,
@@ -225,27 +250,35 @@ class JMXMonitor:
         logger.info(f"Scrape cycle finished in {duration:.2f} seconds.")
 
     def _discover_nodes(self) -> List[str]:
-        """Discovers Cassandra nodes from the cluster endpoint."""
-        logger.info(f"Discovering nodes from endpoint {self.config.cluster_endpoint}...")
-        try:
-            jmx_url = f"service:jmx:rmi:///jndi/rmi://{self.config.cluster_endpoint}:{self.config.jmx_port}/jmxrmi"
-            conn = jmxquery.JMXConnection(jmx_url, timeout=10)
-            query = [jmxquery.JMXQuery("org.apache.cassandra.net:type=FailureDetector", "SimpleStates")]
-            metrics = conn.query(query)
-            
-            nodes = []
-            raw_states = metrics[0].value if metrics and metrics[0].value else ""
-            for node_state in raw_states.split(','):
-                if 'UP' in node_state:
-                    # Regex to extract IP address from formats like '/10.0.0.1=UP'
-                    match = re.search(r'/([\d\.]+)=UP', node_state)
-                    if match:
-                        nodes.append(match.group(1))
-            logger.info(f"Discovery found {len(nodes)} UP nodes.")
-            return nodes
-        except Exception as e:
-            logger.error(f"Error discovering nodes: {e}")
-            return []
+        """Discovers Cassandra nodes by iterating over configured cluster endpoints."""
+        logger.info(
+            "Discovering nodes using endpoints: %s",
+            ", ".join(self.config.cluster_endpoints)
+        )
+
+        for endpoint in self.config.cluster_endpoints:
+            logger.info(f"Attempting discovery from endpoint {endpoint}...")
+            try:
+                jmx_url = f"service:jmx:rmi:///jndi/rmi://{endpoint}:{self.config.jmx_port}/jmxrmi"
+                conn = jmxquery.JMXConnection(jmx_url, timeout=10)
+                query = [jmxquery.JMXQuery("org.apache.cassandra.net:type=FailureDetector", "SimpleStates")]
+                metrics = conn.query(query)
+
+                nodes = []
+                raw_states = metrics[0].value if metrics and metrics[0].value else ""
+                for node_state in raw_states.split(','):
+                    if 'UP' in node_state:
+                        # Regex to extract IP address from formats like '/10.0.0.1=UP'
+                        match = re.search(r'/([\d\.]+)=UP', node_state)
+                        if match:
+                            nodes.append(match.group(1))
+                logger.info(f"Discovery via {endpoint} found {len(nodes)} UP nodes.")
+                return nodes
+            except Exception as e:
+                logger.warning(f"Error discovering nodes from {endpoint}: {e}")
+
+        logger.error("All configured cluster endpoints failed during discovery.")
+        return []
 
     def _get_cluster_name(self, ip: str) -> str:
         """Gets cluster name from any available node."""

@@ -70,8 +70,8 @@ tolerations: []
 affinity: {}
 
 env: []
-#  - name: CASSANDRA_CLUSTER_ENDPOINT
-#    value: "10.0.0.1"
+#  - name: CASSANDRA_CLUSTER_ENDPOINTS
+#    value: "10.0.0.1,10.0.0.2"
 #  - name: JMX_SCRAPE_DURATION
 #    value: "60"
 
@@ -87,7 +87,8 @@ config:
   fileName: config.yml
   data: |
     # Cassandra JMX exporter configuration
-    cluster_endpoint: "127.0.0.1"
+    cluster_endpoints:
+      - "127.0.0.1"
     port: 9095
     jmx_port: 7199
     scrape_duration: 60

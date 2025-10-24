@@ -1,6 +1,6 @@
 # JMX Exporter for Cassandra
 
-A Python-based JMX metrics exporter for Apache Cassandra, designed for multi-cluster environments. This tool automatically discovers all nodes in a cluster by connecting to a single endpoint and exposes their JMX metrics in Prometheus format.
+A Python-based JMX metrics exporter for Apache Cassandra, designed for multi-cluster environments. This tool automatically discovers all nodes in a cluster by connecting to one of several configured seed endpoints and exposes their JMX metrics in Prometheus format.
 
 ## Features
 
@@ -23,7 +23,7 @@ A Python-based JMX metrics exporter for Apache Cassandra, designed for multi-clu
 
 1.  Copy `config.yml.example` to `config.yml`.
 2.  Modify `config.yml` to match your environment. Key parameters are:
-    -   `cluster_endpoint`: The IP of one node in your Cassandra cluster.
+    -   `cluster_endpoints`: A list of seed node IPs in your Cassandra cluster. The exporter will try them in order until one is reachable.
     -   `jmx_port`: The JMX port of your Cassandra nodes (default: 7199).
     -   `jmx_items`: The list of JMX MBeans and attributes you want to collect.
 
@@ -65,7 +65,8 @@ A Helm chart is available under `charts/cassandra-jmx-exporter` for configurable
 ## Configuration via Environment Variables
 
 All key parameters from the config file can be overridden with environment variables for more flexible deployments.
-- `CASSANDRA_CLUSTER_ENDPOINT`
+- `CASSANDRA_CLUSTER_ENDPOINTS` (comma-separated list of seed nodes)
+- `CASSANDRA_CLUSTER_ENDPOINT` (legacy single endpoint override)
 - `JMX_EXPORTER_PORT`
 - `JMX_PORT`
 - `JMX_SCRAPE_DURATION`

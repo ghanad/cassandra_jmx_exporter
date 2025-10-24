@@ -1,6 +1,9 @@
 # The IP or hostname of one of the Cassandra nodes to discover the rest of the cluster.
-# Can be overridden by CASSANDRA_CLUSTER_ENDPOINT environment variable.
-cluster_endpoint: "IP_ADDRESS"
+# Can be overridden by the CASSANDRA_CLUSTER_ENDPOINTS environment variable (comma-separated).
+# The legacy CASSANDRA_CLUSTER_ENDPOINT variable with a single address is still supported.
+cluster_endpoints:
+  - "IP_ADDRESS_1"
+  - "IP_ADDRESS_2"
 
 # Port on which the exporter will expose Prometheus metrics.
 # Can be overridden by JMX_EXPORTER_PORT environment variable.
