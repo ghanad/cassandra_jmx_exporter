@@ -50,6 +50,8 @@ A Python-based JMX metrics exporter for Apache Cassandra, designed for multi-clu
 
 Example manifests are provided in the `k8s/` directory.
 
+A Helm chart is available under `charts/cassandra-jmx-exporter` for configurable deployments, including optional resources such as ServiceMonitor and Ingress for Prometheus scraping and external exposure.
+
 1.  **Create a ConfigMap** from your `config.yml` file:
     ```sh
     kubectl create configmap jmx-exporter-config --from-file=config.yml -n your-namespace
