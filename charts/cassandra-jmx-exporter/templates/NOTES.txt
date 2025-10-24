@@ -1,0 +1,12 @@
+1. Get the application URL by running these commands:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "cassandra-jmx-exporter.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "Metrics URL: http://${NODE_IP}:${NODE_PORT}/metrics"
+{{- else if contains "LoadBalancer" .Values.service.type }}
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "cassandra-jmx-exporter.fullname" . }} -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+  echo "Metrics URL: http://${SERVICE_IP}:{{ .Values.service.ports.metrics }}/metrics"
+{{- else }}
+  kubectl port-forward svc/{{ include "cassandra-jmx-exporter.fullname" . }} {{ .Values.service.ports.metrics }}:{{ .Values.service.ports.metrics }}
+  echo "Metrics URL: http://127.0.0.1:{{ .Values.service.ports.metrics }}/metrics"
+{{- end }}
