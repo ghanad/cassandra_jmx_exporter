@@ -20,7 +20,47 @@ class ConfigLoadTests(unittest.TestCase):
 
     def test_load_configuration_with_env_overrides(self):
         config_data = {
-            'cluster_endpoint': '10.0.0.1',
+            'cluster_endpoints': ['10.0.0.1'],
+            'scrape_duration': 30,
+            'port': 9000,
+            'scan_new_nodes_interval': 45,
+            'jmx_port': 7100,
+            'max_workers': 5,
+            'jmx_items': {
+                'pending_tasks': {
+                    'objectName': 'org.apache.cassandra.metrics:type=ThreadPools',
+                    'attribute': 'PendingTasks'
+                }
+            }
+        }
+
+        with tempfile.NamedTemporaryFile('w', delete=False) as tmp:
+            yaml.safe_dump(config_data, tmp)
+            tmp_path = tmp.name
+
+        try:
+            os.environ['CASSANDRA_CLUSTER_ENDPOINTS'] = '10.0.0.2, 10.0.0.3'
+            os.environ['JMX_SCRAPE_DURATION'] = '120'
+            os.environ['JMX_EXPORTER_PORT'] = '9100'
+            os.environ['NODE_SCAN_INTERVAL'] = '60'
+            os.environ['JMX_PORT'] = '7200'
+            os.environ['MAX_WORKERS'] = '10'
+
+            config = Config.load(tmp_path)
+
+            self.assertEqual(config.cluster_endpoints, ['10.0.0.2', '10.0.0.3'])
+            self.assertEqual(config.scrape_duration, 120)
+            self.assertEqual(config.port, 9100)
+            self.assertEqual(config.scan_new_nodes_interval, 60)
+            self.assertEqual(config.jmx_port, 7200)
+            self.assertEqual(config.max_workers, 10)
+            self.assertEqual(config.jmx_items, config_data['jmx_items'])
+        finally:
+            os.unlink(tmp_path)
+
+    def test_load_configuration_supports_legacy_single_endpoint_env(self):
+        config_data = {
+            'cluster_endpoints': ['10.0.0.1'],
             'scrape_duration': 30,
             'port': 9000,
             'scan_new_nodes_interval': 45,
@@ -40,25 +80,14 @@ class ConfigLoadTests(unittest.TestCase):
 
         try:
             os.environ['CASSANDRA_CLUSTER_ENDPOINT'] = '10.0.0.2'
-            os.environ['JMX_SCRAPE_DURATION'] = '120'
-            os.environ['JMX_EXPORTER_PORT'] = '9100'
-            os.environ['NODE_SCAN_INTERVAL'] = '60'
-            os.environ['JMX_PORT'] = '7200'
-            os.environ['MAX_WORKERS'] = '10'
 
             config = Config.load(tmp_path)
 
-            self.assertEqual(config.cluster_endpoint, '10.0.0.2')
-            self.assertEqual(config.scrape_duration, 120)
-            self.assertEqual(config.port, 9100)
-            self.assertEqual(config.scan_new_nodes_interval, 60)
-            self.assertEqual(config.jmx_port, 7200)
-            self.assertEqual(config.max_workers, 10)
-            self.assertEqual(config.jmx_items, config_data['jmx_items'])
+            self.assertEqual(config.cluster_endpoints, ['10.0.0.2'])
         finally:
             os.unlink(tmp_path)
 
-    def test_load_configuration_missing_cluster_endpoint_raises(self):
+    def test_load_configuration_missing_cluster_endpoints_raises(self):
         config_data = {
             'scrape_duration': 30,
             'port': 9000,
@@ -128,7 +157,7 @@ class JMXMonitorTests(unittest.TestCase):
                     'attribute': 'PendingTasks'
                 }
             },
-            cluster_endpoint='10.0.0.1',
+            cluster_endpoints=['10.0.0.1', '10.0.0.5'],
             scrape_duration=60,
             port=9095,
             scan_new_nodes_interval=120,
@@ -150,6 +179,21 @@ class JMXMonitorTests(unittest.TestCase):
             nodes = self.monitor._discover_nodes()
 
         self.assertEqual(nodes, ['10.0.0.2', '10.0.0.4'])
+
+    def test_discover_nodes_falls_back_to_second_endpoint(self):
+        fake_metric = types.SimpleNamespace(value='/10.0.0.6=UP')
+        successful_conn = mock.MagicMock()
+        successful_conn.query.return_value = [fake_metric]
+
+        def fake_jmx_connection(url, timeout):
+            if '10.0.0.1' in url:
+                raise Exception('host unreachable')
+            return successful_conn
+
+        with mock.patch.object(jmx_monitoring.jmxquery, 'JMXConnection', side_effect=fake_jmx_connection):
+            nodes = self.monitor._discover_nodes()
+
+        self.assertEqual(nodes, ['10.0.0.6'])
 
     def test_collect_from_single_node_sets_metric_values(self):
         fake_metric = types.SimpleNamespace(metric_name='pending_tasks', value=5)
