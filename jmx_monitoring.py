@@ -4,7 +4,7 @@ import socket
 import time
 import jmxquery
 import threading
-from prometheus_client import Counter, Gauge, Info
+from prometheus_client import Counter, Gauge, Histogram, Info
 import re
 import os
 import yaml
@@ -52,13 +52,55 @@ class InternalMetrics:
             'jmx_exporter_scrape_duration_seconds',
             'Duration of the last scrape cycle in seconds.'
         )
+        self.scrapes_in_progress = Gauge(
+            'jmx_exporter_scrapes_in_progress',
+            'Number of scrape cycles currently running.'
+        )
         self.nodes_discovered = Gauge(
             'jmx_exporter_nodes_discovered',
             'The current number of Cassandra nodes being monitored.'
         )
+        self.discovery_duration_seconds = Histogram(
+            'jmx_exporter_discovery_duration_seconds',
+            'Time spent discovering nodes in seconds.'
+        )
+        self.discovery_errors_total = Counter(
+            'jmx_exporter_discovery_errors_total',
+            'Total number of errors encountered during node discovery.'
+        )
         self.node_scrape_errors_total = Counter(
             'jmx_exporter_node_scrape_errors_total',
             'Total number of scrape errors per node.',
+            ['ip']
+        )
+        self.node_errors_total = Counter(
+            'jmx_exporter_node_errors_total',
+            'Categorized scrape errors per node.',
+            ['ip', 'error_type']
+        )
+        self.node_timeouts_total = Counter(
+            'jmx_exporter_node_timeouts_total',
+            'Total number of timeout errors per node.',
+            ['ip']
+        )
+        self.node_connect_duration_seconds = Histogram(
+            'jmx_exporter_node_connect_duration_seconds',
+            'Time to establish a JMX connection per node.',
+            ['ip']
+        )
+        self.node_query_duration_seconds = Histogram(
+            'jmx_exporter_node_query_duration_seconds',
+            'Time to execute the JMX query per node.',
+            ['ip']
+        )
+        self.node_samples_emitted = Gauge(
+            'jmx_exporter_node_samples_emitted',
+            'Number of samples emitted for a node during the last scrape.',
+            ['ip']
+        )
+        self.node_last_success_timestamp_seconds = Gauge(
+            'jmx_exporter_node_last_success_timestamp_seconds',
+            'Unix timestamp of the last successful scrape per node.',
             ['ip']
         )
 
@@ -203,6 +245,26 @@ class JMXMonitor:
         self._lock = threading.Lock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers)
 
+    def _classify_exception(self, exception: Exception) -> str:
+        message = str(exception).lower()
+        if isinstance(exception, (TimeoutError, socket.timeout)):
+            return 'timeout'
+        if 'timed out' in message:
+            return 'timeout'
+        if 'parse' in message or 'format' in message:
+            return 'parse'
+        if 'jmx' in message:
+            return 'jmx'
+        return 'other'
+
+    def _record_node_error(self, ip: str, exception: Exception = None, error_type: str = None):
+        if error_type is None:
+            error_type = self._classify_exception(exception) if exception else 'other'
+        self.internal_metrics.node_scrape_errors_total.labels(ip=ip).inc()
+        self.internal_metrics.node_errors_total.labels(ip=ip, error_type=error_type).inc()
+        if error_type == 'timeout':
+            self.internal_metrics.node_timeouts_total.labels(ip=ip).inc()
+
     def _collect_from_single_node(self, ip: str):
         """
         Performs a single metric collection from one node.
@@ -210,25 +272,49 @@ class JMXMonitor:
         """
         try:
             jmx_url = f"service:jmx:rmi:///jndi/rmi://{ip}:{self.config.jmx_port}/jmxrmi"
-            jmx_conn = jmxquery.JMXConnection(jmx_url, timeout=10)
-            
+            connect_start = time.time()
+            try:
+                jmx_conn = jmxquery.JMXConnection(jmx_url, timeout=10)
+            except Exception as e:
+                connect_duration = time.time() - connect_start
+                self.internal_metrics.node_connect_duration_seconds.labels(ip=ip).observe(connect_duration)
+                raise
+
+            connect_duration = time.time() - connect_start
+            self.internal_metrics.node_connect_duration_seconds.labels(ip=ip).observe(connect_duration)
+
             queries = [
                 jmxquery.JMXQuery(item['objectName'], item['attribute'], metric_name=name)
                 for name, item in self.config.jmx_items.items()
             ]
-            metrics = jmx_conn.query(queries)
-            
+
+            query_start = time.time()
+            try:
+                metrics = jmx_conn.query(queries)
+            except Exception:
+                query_duration = time.time() - query_start
+                self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(query_duration)
+                raise
+
+            query_duration = time.time() - query_start
+            self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(query_duration)
+
+            sample_count = 0
             for metric in metrics:
                 try:
                     value = float(metric.value)
                     self.metrics_manager.set_metric_value(metric.metric_name, ip, value)
+                    sample_count += 1
                 except (ValueError, TypeError):
                     logger.warning(f"Could not convert metric '{metric.metric_name}' value '{metric.value}' to float for node {ip}.")
-            
+                    self._record_node_error(ip, error_type='parse')
+
+            self.internal_metrics.node_samples_emitted.labels(ip=ip).set(sample_count)
+            self.internal_metrics.node_last_success_timestamp_seconds.labels(ip=ip).set(time.time())
             logger.debug(f"Successfully collected metrics from {ip}")
         except Exception as e:
             logger.error(f"Error collecting metrics from {ip}: {e}")
-            self.internal_metrics.node_scrape_errors_total.labels(ip=ip).inc()
+            self._record_node_error(ip, exception=e)
 
     def _run_scrape_cycle(self):
         """
@@ -241,9 +327,13 @@ class JMXMonitor:
             nodes_to_scrape = list(self.cluster_node_list)
 
         # Submit collection tasks to the thread pool
+        self.internal_metrics.scrapes_in_progress.set(len(nodes_to_scrape))
         future_to_node = {self.executor.submit(self._collect_from_single_node, ip): ip for ip in nodes_to_scrape}
-        concurrent.futures.wait(future_to_node)
-        
+        try:
+            concurrent.futures.wait(future_to_node)
+        finally:
+            self.internal_metrics.scrapes_in_progress.set(0)
+
         duration = time.time() - start_time
         self.internal_metrics.scrape_duration_seconds.set(duration)
         self.internal_metrics.scrapes_total.inc()
@@ -258,6 +348,7 @@ class JMXMonitor:
 
         for endpoint in self.config.cluster_endpoints:
             logger.info(f"Attempting discovery from endpoint {endpoint}...")
+            attempt_start = time.time()
             try:
                 jmx_url = f"service:jmx:rmi:///jndi/rmi://{endpoint}:{self.config.jmx_port}/jmxrmi"
                 conn = jmxquery.JMXConnection(jmx_url, timeout=10)
@@ -272,10 +363,13 @@ class JMXMonitor:
                         match = re.search(r'/([\d\.]+)=UP', node_state)
                         if match:
                             nodes.append(match.group(1))
+                self.internal_metrics.discovery_duration_seconds.observe(time.time() - attempt_start)
                 logger.info(f"Discovery via {endpoint} found {len(nodes)} UP nodes.")
                 return nodes
             except Exception as e:
                 logger.warning(f"Error discovering nodes from {endpoint}: {e}")
+                self.internal_metrics.discovery_duration_seconds.observe(time.time() - attempt_start)
+                self.internal_metrics.discovery_errors_total.inc()
 
         logger.error("All configured cluster endpoints failed during discovery.")
         return []

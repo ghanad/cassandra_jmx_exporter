@@ -73,6 +73,27 @@ All key parameters from the config file can be overridden with environment varia
 - `NODE_SCAN_INTERVAL`
 - `MAX_WORKERS`
 
+## Internal Exporter Metrics
+
+The exporter publishes a set of internal metrics that make it easier to monitor its own health, performance, and error modes. These metrics are exposed on the same `/metrics` endpoint as the Cassandra data.
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `jmx_exporter_info` | Info | `version` | Static information about the exporter build. |
+| `jmx_exporter_scrapes_total` | Counter | – | Total number of completed scrape cycles. |
+| `jmx_exporter_scrape_duration_seconds` | Gauge | – | Duration in seconds of the most recent scrape cycle. |
+| `jmx_exporter_scrapes_in_progress` | Gauge | – | Number of scrape cycles currently running (should be 0 or 1). |
+| `jmx_exporter_nodes_discovered` | Gauge | – | Number of Cassandra nodes currently scheduled for scraping. |
+| `jmx_exporter_discovery_duration_seconds` | Histogram | – | Time in seconds spent performing node discovery attempts. |
+| `jmx_exporter_discovery_errors_total` | Counter | – | Total number of failed discovery attempts. |
+| `jmx_exporter_node_scrape_errors_total` | Counter | `ip` | Aggregate count of scrape errors for each node. |
+| `jmx_exporter_node_errors_total` | Counter | `ip`, `error_type` | Categorised scrape errors per node (`timeout`, `jmx`, `parse`, `other`). |
+| `jmx_exporter_node_timeouts_total` | Counter | `ip` | Number of scrape attempts per node that ended in a timeout. |
+| `jmx_exporter_node_connect_duration_seconds` | Histogram | `ip` | Time spent establishing a JMX connection to a node. |
+| `jmx_exporter_node_query_duration_seconds` | Histogram | `ip` | Time spent executing the JMX query against a node. |
+| `jmx_exporter_node_samples_emitted` | Gauge | `ip` | Number of samples exported for a node during the last successful scrape. |
+| `jmx_exporter_node_last_success_timestamp_seconds` | Gauge | `ip` | Unix timestamp for the last successful scrape of a node. |
+
 ## License
 
 This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
