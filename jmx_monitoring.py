@@ -255,6 +255,15 @@ class JMXMonitor:
         self._shutdown = threading.Event()
         self._lock = threading.Lock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers)
+        self._local_jmx_warning_logged = False
+
+    def _is_loopback_connection_error(self, exception: Exception) -> bool:
+        """Detects when the JMX connection is redirected to a loopback address."""
+        message = str(exception)
+        if not message:
+            return False
+        message_lower = message.lower()
+        return 'connection refused' in message_lower and '127.0.0.1' in message
 
     def _classify_exception(self, exception: Exception) -> str:
         message = str(exception).lower()
@@ -381,6 +390,16 @@ class JMXMonitor:
                 logger.warning(f"Error discovering nodes from {endpoint}: {e}")
                 self.internal_metrics.discovery_duration_seconds.observe(time.time() - attempt_start)
                 self.internal_metrics.discovery_errors_total.inc()
+                if self._is_loopback_connection_error(e) and not self._local_jmx_warning_logged:
+                    logger.error(
+                        "JMX endpoint %s redirected the connection to 127.0.0.1. "
+                        "This usually means Cassandra is running with LOCAL_JMX=yes or is otherwise "
+                        "advertising a loopback address. Configure Cassandra to allow remote JMX connections "
+                        "(for example, set LOCAL_JMX=no and java.rmi.server.hostname to the pod IP) so that the "
+                        "exporter can reach it.",
+                        endpoint
+                    )
+                    self._local_jmx_warning_logged = True
 
         logger.error("All configured cluster endpoints failed during discovery.")
         return []

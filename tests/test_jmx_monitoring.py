@@ -206,6 +206,19 @@ class JMXMonitorTests(unittest.TestCase):
 
         set_metric_value.assert_called_once_with('pending_tasks', '10.0.0.2', 5.0)
 
+    def test_discover_nodes_logs_local_jmx_hint_once(self):
+        error_message = (
+            "Error calling JMX: { \"error\": \"connection-error\", \"message\":\"Connection refused to host: 127.0.0.1; "
+            "nested exception is: java.net.ConnectException: Connection refused\"}"
+        )
+
+        with mock.patch.object(jmx_monitoring, 'create_jmx_connection', side_effect=Exception(error_message)):
+            with self.assertLogs(jmx_monitoring.logger, level='WARNING') as captured_logs:
+                self.monitor._discover_nodes()
+
+        matching_logs = [entry for entry in captured_logs.output if 'LOCAL_JMX' in entry]
+        self.assertEqual(len(matching_logs), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
