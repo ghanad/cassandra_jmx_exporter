@@ -17,6 +17,7 @@ A Python-based JMX metrics exporter for Apache Cassandra, designed for multi-clu
 ### Prerequisites
 
 -   Python 3.8+
+-   Java Runtime Environment (JRE) 11 or later (required by `jmxquery` for JMX access)
 -   Docker (for containerized deployment)
 
 ### Configuration
