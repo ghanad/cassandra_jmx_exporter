@@ -1,0 +1,36 @@
+version: "3.8"
+
+services:
+  cassandra:
+    image: cassandra:3.11
+    container_name: e2e_cassandra
+    environment:
+      - CASSANDRA_CLUSTER_NAME=E2E
+      - MAX_HEAP_SIZE=512M
+      - HEAP_NEWSIZE=100M
+      - LOCAL_JMX=no
+      - JVM_OPTS=-Dcom.sun.management.jmxremote \
+         -Dcom.sun.management.jmxremote.port=7199 \
+         -Dcom.sun.management.jmxremote.rmi.port=7199 \
+         -Djava.rmi.server.hostname=cassandra \
+         -Dcom.sun.management.jmxremote.authenticate=false \
+         -Dcom.sun.management.jmxremote.ssl=false  \
+         -Dcom.sun.management.jmxremote.local.only=false
+    healthcheck:
+      test: ["CMD-SHALL", "nodetool status | grep -E\"\\bUN\\b\" -q]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+   exporter:
+    image: ghrp.io/prometheus/jmx-exporter:0.20.0
+    container_name: e2e_cassandra_exporter
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    command: ["5556", "/config.yaml"]
+    volumes:
+      - ./jmx-config.yaml:/config.yaml:ro
+    ports:
+      - "5556:5556"

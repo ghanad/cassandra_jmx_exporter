@@ -1,0 +1,33 @@
+startDelaySeconds: 0
+hostPort: "cassandra:7199"
+lowercaseOutputName: true
+lowercaseOutputLabelNames: true
+
+whitelistObjectNames:
+  - "org.apache.cassandra.metrics:*"
+
+rules:
+  - pattern: 'org.apache.cassandra.metrics<type=(\\w+), name=(\\w+)(?:, scope=(\\w+))?><>Count'
+    name: cassandra_$1_$2_total
+    labels:
+      scope: "$3"
+    type: COUNTER
+    help: "Cassandra $1 $2 total"
+
+  - pattern: 'org.apache.cassandra.metrics<type=(\\w+), name=(\\w+)(?:, scope=(\\w+))?><>Value'
+    name: cassandra_$1_$2
+    labels:
+      scope: "$3"
+    type: GAUGE
+
+  - pattern: 'org.apache.cassandra.metrics<type=(\\w+), name=(\\w+)(?:, scope=(\\w+))?, attribute=(\\w+)><>(?:Count|Value|Mean|OneMinuteRate|FiveMinuteRate|FifteenMinuteRate|Snapshot|\\w+)'
+    name: cassandra_$1_$2_$4
+    labels:
+      scope: "$3"
+    type: GAUGE
+
+  - pattern: '.*'
+    name: jmx_unmatched
+    type: COUNTER
+    value: 0
+    help: "Unmatched metrics (should remain 0)"

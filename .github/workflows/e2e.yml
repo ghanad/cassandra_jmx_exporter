@@ -1,0 +1,38 @@
+name: e2e-cassandra-jmx
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch: {}
+
+name:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Compose
+        run: docker compose version
+
+      - name: Run E2E test
+        run: |
+          bash test/e2e/assert.sh
+        env:
+          MIN_EXPECTED: "50"
+          EXPORTER_URL: "http://localhost:5556/metrics"
+
+      - name: Always show logs on failure
+        if: failure()
+        run: |
+          docker compose -f test/e2e/docker-compose.yaml logs cassandra || true
+          docker compose -f test/e2e/docker-compose.yml logs exporter || true
+          docker compose -f test/e2e/docker-compose.yml down -v || true
+
+      - name: Teardown
+        if: always()
+        run: docker compose -f test/e2e/docker-compose.yml down -v || true
