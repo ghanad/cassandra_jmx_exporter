@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  cassandra-jmx-exporter:
+    image: alig1/jmx-cassandra-exporter:latest
+    container_name: cassandra-jmx-exporter
+    ports:
+      - "9095:9095"
+      - "9096:9096"
+    volumes:
+      - ./config.yml.example:/etc/jmx-exporter/config.yml:ro
+    environment:
+      # Comma separated list of Cassandra seed nodes. Override as needed.
+      - CASSANDRA_CLUSTER_ENDPOINTS=127.0.0.1
+      # Override ports or scrape interval if different from defaults.
+      - JMX_EXPORTER_PORT=9095
+      - JMX_PORT=7199
+      - JMX_SCRAPE_DURATION=15
+      - NODE_SCAN_INTERVAL=300
+    restart: unless-stopped
