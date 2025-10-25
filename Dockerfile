@@ -10,8 +10,12 @@ RUN useradd --no-create-home appuser
 # Copy the dependencies file first to leverage Docker's layer caching
 COPY --chown=appuser:appuser requirements.txt .
 
-# Install any needed packages specified in requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# Install system dependencies required by the application
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        default-jre-headless \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code
 COPY --chown=appuser:appuser jmx_monitoring.py .
