@@ -16,8 +16,19 @@ from dataclasses import dataclass, field
 import json
 from wsgiref.simple_server import make_server
 import concurrent.futures
+import inspect
 
 VERSION = "1.5.0"
+
+_JMX_CONNECTION_SUPPORTS_TIMEOUT = 'timeout' in inspect.signature(jmxquery.JMXConnection).parameters
+
+
+def create_jmx_connection(jmx_url: str) -> jmxquery.JMXConnection:
+    """Create a JMXConnection while gracefully handling timeout support."""
+    if _JMX_CONNECTION_SUPPORTS_TIMEOUT:
+        return jmxquery.JMXConnection(jmx_url, timeout=10)
+    logger.debug("jmxquery.JMXConnection does not support timeout parameter; creating connection without it.")
+    return jmxquery.JMXConnection(jmx_url)
 
 # Configure logging
 logging.basicConfig(
@@ -274,7 +285,7 @@ class JMXMonitor:
             jmx_url = f"service:jmx:rmi:///jndi/rmi://{ip}:{self.config.jmx_port}/jmxrmi"
             connect_start = time.time()
             try:
-                jmx_conn = jmxquery.JMXConnection(jmx_url, timeout=10)
+                jmx_conn = create_jmx_connection(jmx_url)
             except Exception as e:
                 connect_duration = time.time() - connect_start
                 self.internal_metrics.node_connect_duration_seconds.labels(ip=ip).observe(connect_duration)
@@ -351,7 +362,7 @@ class JMXMonitor:
             attempt_start = time.time()
             try:
                 jmx_url = f"service:jmx:rmi:///jndi/rmi://{endpoint}:{self.config.jmx_port}/jmxrmi"
-                conn = jmxquery.JMXConnection(jmx_url, timeout=10)
+                conn = create_jmx_connection(jmx_url)
                 query = [jmxquery.JMXQuery("org.apache.cassandra.net:type=FailureDetector", "SimpleStates")]
                 metrics = conn.query(query)
 
@@ -378,7 +389,7 @@ class JMXMonitor:
         """Gets cluster name from any available node."""
         try:
             jmx_url = f"service:jmx:rmi:///jndi/rmi://{ip}:{self.config.jmx_port}/jmxrmi"
-            jmx_conn = jmxquery.JMXConnection(jmx_url, timeout=10)
+            jmx_conn = create_jmx_connection(jmx_url)
             query = jmxquery.JMXQuery("org.apache.cassandra.db:type=StorageService", "ClusterName")
             result = jmx_conn.query([query])
             return result[0].value if result else "unknown"

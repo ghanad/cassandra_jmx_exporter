@@ -175,7 +175,7 @@ class JMXMonitorTests(unittest.TestCase):
         fake_conn = mock.MagicMock()
         fake_conn.query.return_value = [fake_metric]
 
-        with mock.patch.object(jmx_monitoring.jmxquery, 'JMXConnection', return_value=fake_conn):
+        with mock.patch.object(jmx_monitoring, 'create_jmx_connection', return_value=fake_conn):
             nodes = self.monitor._discover_nodes()
 
         self.assertEqual(nodes, ['10.0.0.2', '10.0.0.4'])
@@ -185,12 +185,12 @@ class JMXMonitorTests(unittest.TestCase):
         successful_conn = mock.MagicMock()
         successful_conn.query.return_value = [fake_metric]
 
-        def fake_jmx_connection(url, timeout):
+        def fake_create_connection(url):
             if '10.0.0.1' in url:
                 raise Exception('host unreachable')
             return successful_conn
 
-        with mock.patch.object(jmx_monitoring.jmxquery, 'JMXConnection', side_effect=fake_jmx_connection):
+        with mock.patch.object(jmx_monitoring, 'create_jmx_connection', side_effect=fake_create_connection):
             nodes = self.monitor._discover_nodes()
 
         self.assertEqual(nodes, ['10.0.0.6'])
@@ -200,7 +200,7 @@ class JMXMonitorTests(unittest.TestCase):
         fake_conn = mock.MagicMock()
         fake_conn.query.return_value = [fake_metric]
 
-        with mock.patch.object(jmx_monitoring.jmxquery, 'JMXConnection', return_value=fake_conn):
+        with mock.patch.object(jmx_monitoring, 'create_jmx_connection', return_value=fake_conn):
             with mock.patch.object(self.metrics_manager, 'set_metric_value') as set_metric_value:
                 self.monitor._collect_from_single_node('10.0.0.2')
 
