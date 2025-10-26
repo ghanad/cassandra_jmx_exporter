@@ -2,7 +2,7 @@ version: "3.9"
 
 services:
   cassandra-jmx-exporter:
-    image: alig1/jmx-cassandra-exporter:latest
+    image: alig1/cassandra-jmx-exporter:latest
     container_name: cassandra-jmx-exporter
     ports:
       - "9095:9095"
