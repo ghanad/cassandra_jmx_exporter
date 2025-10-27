@@ -202,12 +202,16 @@ class MetricsManager:
 
     def get_or_create_metric(self, name: str, description: str) -> Gauge:
         if name not in self._metrics:
-            self._metrics[name] = Gauge(f'cassandra_{name}', description, ['ip', 'cluster'])
+            self._metrics[name] = Gauge(
+                f'cassandra_{name}_total',
+                description,
+                ['ip', 'cluster_name']
+            )
         return self._metrics[name]
 
     def set_metric_value(self, name: str, ip: str, value: float):
         if name in self._metrics:
-            self._metrics[name].labels(ip=ip, cluster=self._cluster_name).set(value)
+            self._metrics[name].labels(ip=ip, cluster_name=self._cluster_name).set(value)
 
 # --- Health Check Server ---
 class HealthCheck:
