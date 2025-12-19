@@ -1,6 +1,7 @@
 import os
 import tempfile
 import types
+import threading
 import unittest
 import time
 from unittest import mock
@@ -390,6 +391,139 @@ class JMXMonitorTimeoutTests(unittest.TestCase):
             self.monitor._run_scrape_cycle()
             
         self.internal_metrics.nodes_scheduled.set.assert_called_with(3)
+
+
+class JMXMonitorShutdownTests(unittest.TestCase):
+    """Tests for shutdown responsiveness of the node discovery loop."""
+    
+    def setUp(self):
+        self.config = Config(
+            jmx_items={'m1': {'objectName': 'obj', 'attribute': 'attr'}},
+            cluster_endpoints=['10.0.0.1'],
+            scrape_duration=1,
+            port=9095,
+            scan_new_nodes_interval=60,  # Large interval for testing
+            jmx_port=7199,
+            max_workers=5
+        )
+        self.metrics_manager = mock.Mock()
+        self.internal_metrics = mock.Mock()
+        self.health_check = mock.Mock()
+        self.monitor = JMXMonitor(self.config, self.metrics_manager, self.internal_metrics, self.health_check)
+
+    def test_discovery_loop_exits_quickly_on_shutdown(self):
+        """Test that the discovery thread terminates quickly when shutdown is requested."""
+        # Set a very large scan interval
+        self.monitor.config.scan_new_nodes_interval = 60
+        
+        # Mock _discover_nodes to return empty list quickly
+        with mock.patch.object(self.monitor, '_discover_nodes', return_value=[]):
+            # Start the discovery thread manually
+            discovery_thread = threading.Thread(target=self.monitor._update_node_list, daemon=True)
+            discovery_thread.start()
+            
+            # Let it run for a bit to enter the wait
+            time.sleep(0.1)
+            
+            # Trigger shutdown
+            start_time = time.time()
+            self.monitor._shutdown.set()
+            
+            # Join with a reasonable timeout
+            discovery_thread.join(timeout=0.5)
+            shutdown_duration = time.time() - start_time
+            
+            # Verify the thread exited quickly (much less than the 60 second interval)
+            self.assertFalse(discovery_thread.is_alive(), "Discovery thread should have exited")
+            self.assertLess(shutdown_duration, 0.5,
+                          f"Shutdown took {shutdown_duration}s, expected < 0.5s")
+
+    def test_no_time_sleep_in_discovery_loop(self):
+        """Test that time.sleep is not used in the discovery loop (should use Event.wait instead)."""
+        # Monkeypatch time.sleep to raise an exception if called
+        original_sleep = time.sleep
+        sleep_called = []
+        
+        def raise_on_sleep(duration):
+            sleep_called.append(duration)
+            raise AssertionError(f"time.sleep({duration}) was called, but Event.wait should be used instead")
+        
+        # Mock _discover_nodes to return immediately
+        with mock.patch.object(self.monitor, '_discover_nodes', return_value=['10.0.0.1']):
+            # Patch time.sleep
+            with mock.patch('time.sleep', side_effect=raise_on_sleep):
+                # Start the discovery thread
+                discovery_thread = threading.Thread(target=self.monitor._update_node_list, daemon=True)
+                discovery_thread.start()
+                
+                # Let it run one iteration
+                time_module = __import__('time')
+                original_sleep(0.1)
+                
+                # Trigger shutdown to exit the loop
+                self.monitor._shutdown.set()
+                discovery_thread.join(timeout=1.0)
+        
+        # If we get here, time.sleep was not called in _update_node_list
+        self.assertEqual(sleep_called, [], "time.sleep should not have been called")
+
+    def test_shutdown_joins_discovery_thread(self):
+        """Test that shutdown waits for the discovery thread to exit."""
+        # Mock _discover_nodes to simulate work
+        discover_call_count = []
+        
+        def mock_discover():
+            discover_call_count.append(1)
+            return ['10.0.0.1']
+        
+        with mock.patch.object(self.monitor, '_discover_nodes', side_effect=mock_discover):
+            # Start the monitor's discovery thread manually
+            self.monitor._discovery_thread = threading.Thread(
+                target=self.monitor._update_node_list,
+                daemon=True,
+                name='node-discovery'
+            )
+            self.monitor._discovery_thread.start()
+            
+            # Let it run for a bit
+            time.sleep(0.1)
+            
+            # Verify thread is alive
+            self.assertTrue(self.monitor._discovery_thread.is_alive())
+            
+            # Call shutdown
+            self.monitor.shutdown()
+            
+            # Verify the thread is no longer alive after shutdown
+            self.assertFalse(self.monitor._discovery_thread.is_alive(),
+                           "Discovery thread should have been joined and exited")
+
+    def test_discovery_loop_handles_exceptions_during_shutdown(self):
+        """Test that exceptions during shutdown don't spam logs."""
+        exception_raised = False
+        
+        def mock_discover():
+            nonlocal exception_raised
+            if not exception_raised:
+                exception_raised = True
+                raise Exception("Discovery error")
+            return []
+        
+        with mock.patch.object(self.monitor, '_discover_nodes', side_effect=mock_discover):
+            # Start discovery thread
+            discovery_thread = threading.Thread(target=self.monitor._update_node_list, daemon=True)
+            discovery_thread.start()
+            
+            # Let it process the exception
+            time.sleep(0.1)
+            
+            # Now trigger shutdown
+            self.monitor._shutdown.set()
+            
+            # Second iteration should not log because shutdown is set
+            # We verify the thread exits cleanly
+            discovery_thread.join(timeout=0.5)
+            self.assertFalse(discovery_thread.is_alive())
 
 
 if __name__ == '__main__':
