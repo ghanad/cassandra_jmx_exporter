@@ -27,6 +27,11 @@ scan_new_nodes_interval: 120
 # Can be overridden by MAX_WORKERS environment variable.
 max_workers: 20
 
+# Disable the collection of internal exporter metrics (e.g., jmx_exporter_scrapes_total).
+# Useful for reducing the number of time series produced by the exporter.
+# Can be overridden by DISABLE_INTERNAL_METRICS environment variable (e.g., "true").
+disable_internal_metrics: false
+
 jmx_items:
   cluster_name:
     objectName: org.apache.cassandra.service:type=StorageService

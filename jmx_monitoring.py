@@ -18,7 +18,7 @@ from wsgiref.simple_server import make_server
 import concurrent.futures
 import inspect
 
-VERSION = "1.5.0"
+VERSION = "1.5.1"
 
 _JMX_CONNECTION_SUPPORTS_TIMEOUT = 'timeout' in inspect.signature(jmxquery.JMXConnection).parameters
 
@@ -115,6 +115,34 @@ class InternalMetrics:
             ['ip']
         )
 
+class NoOpMetric:
+    """A mock metric class that performs no operations."""
+    def inc(self, *args, **kwargs): pass
+    def set(self, *args, **kwargs): pass
+    def observe(self, *args, **kwargs): pass
+    def labels(self, *args, **kwargs): return self
+    def info(self, *args, **kwargs): pass
+
+class NoOpMetrics:
+    """A placeholder for InternalMetrics that does nothing."""
+    def __init__(self):
+        noop = NoOpMetric()
+        self.info = noop
+        self.scrapes_total = noop
+        self.scrape_duration_seconds = noop
+        self.scrapes_in_progress = noop
+        self.nodes_discovered = noop
+        self.discovery_duration_seconds = noop
+        self.discovery_errors_total = noop
+        self.node_scrape_errors_total = noop
+        self.node_errors_total = noop
+        self.node_timeouts_total = noop
+        self.node_connect_duration_seconds = noop
+        self.node_query_duration_seconds = noop
+        self.node_samples_emitted = noop
+        self.node_last_success_timestamp_seconds = noop
+
+
 # --- Configuration Management ---
 @dataclass
 class Config:
@@ -126,6 +154,7 @@ class Config:
     scan_new_nodes_interval: int
     jmx_port: int = 7199
     max_workers: int = 20
+    disable_internal_metrics: bool = False
 
     @classmethod
     def load(cls, config_path: str = None) -> 'Config':
@@ -167,6 +196,8 @@ class Config:
             scan_interval = int(os.getenv('NODE_SCAN_INTERVAL', config_data.get('scan_new_nodes_interval', 120)))
             jmx_port = int(os.getenv('JMX_PORT', config_data.get('jmx_port', 7199)))
             max_workers = int(os.getenv('MAX_WORKERS', config_data.get('max_workers', 20)))
+            disable_internal_metrics_str = str(os.getenv('DISABLE_INTERNAL_METRICS', config_data.get('disable_internal_metrics', 'false'))).lower()
+            disable_internal_metrics = disable_internal_metrics_str in ('true', '1', 't', 'y', 'yes')
 
             if not cluster_endpoints:
                 raise ConfigError(
@@ -183,7 +214,8 @@ class Config:
                 port=port,
                 scan_new_nodes_interval=scan_interval,
                 jmx_port=jmx_port,
-                max_workers=max_workers
+                max_workers=max_workers,
+                disable_internal_metrics=disable_internal_metrics
             )
         except FileNotFoundError:
             raise ConfigError(f"Config file not found at {final_path}")
@@ -250,7 +282,7 @@ class HealthCheck:
 
 # --- Core JMX Monitoring Logic ---
 class JMXMonitor:
-    def __init__(self, config: Config, metrics_manager: MetricsManager, internal_metrics: InternalMetrics, health_check: HealthCheck):
+    def __init__(self, config: Config, metrics_manager: MetricsManager, internal_metrics: Any, health_check: HealthCheck):
         self.config = config
         self.metrics_manager = metrics_manager
         self.internal_metrics = internal_metrics
@@ -487,10 +519,15 @@ def main():
         
         config = Config.load(args.config)
         metrics_manager = MetricsManager()
-        internal_metrics = InternalMetrics()
-        health_check = HealthCheck()
         
-        internal_metrics.info.info({'version': VERSION})
+        if config.disable_internal_metrics:
+            logger.info("Internal metrics are disabled.")
+            internal_metrics = NoOpMetrics()
+        else:
+            internal_metrics = InternalMetrics()
+            internal_metrics.info.info({'version': VERSION})
+
+        health_check = HealthCheck()
 
         # Start Prometheus and Health Check servers in threads
         from prometheus_client import start_http_server
