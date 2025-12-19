@@ -385,8 +385,33 @@ class JMXMonitor:
         # Submit collection tasks to the thread pool
         self.internal_metrics.scrapes_in_progress.set(len(nodes_to_scrape))
         future_to_node = {self.executor.submit(self._collect_from_single_node, ip): ip for ip in nodes_to_scrape}
+        
+        # Calculate timeout budget: scrape_duration minus a small margin to allow for overhead
+        budget = max(0.0, self.config.scrape_duration - 0.5)
+        
         try:
-            concurrent.futures.wait(future_to_node)
+            done, not_done = concurrent.futures.wait(
+                future_to_node, 
+                timeout=budget, 
+                return_when=concurrent.futures.ALL_COMPLETED
+            )
+            
+            for future in done:
+                ip = future_to_node[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    # Exceptions are already logged and recorded in _collect_from_single_node
+                    logger.debug(f"Future for node {ip} raised an exception: {e}")
+
+            for future in not_done:
+                ip = future_to_node[future]
+                logger.warning(f"Scrape for node {ip} timed out after {budget}s")
+                future.cancel()
+                self._record_node_error(ip, error_type='timeout')
+                # Record a duration for the timed out node to ensure metrics are consistent
+                self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(budget)
+
         finally:
             self.internal_metrics.scrapes_in_progress.set(0)
 
@@ -503,7 +528,9 @@ class JMXMonitor:
         logger.info("Shutting down JMX monitor...")
         self.health_check.set_ready(False)
         self._shutdown.set()
-        self.executor.shutdown(wait=True)
+        # Use wait=False to avoid hanging on stuck threads during shutdown.
+        # Stuck threads will be terminated when the main process exits.
+        self.executor.shutdown(wait=False)
         logger.info("Shutdown complete.")
 
 def main():
