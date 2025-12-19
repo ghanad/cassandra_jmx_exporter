@@ -313,6 +313,7 @@ class JMXMonitor:
         self._node_skip_until: Dict[str, float] = {}
         self._timeout_threshold = 3
         self._skip_cooldown = 60
+        self._discovery_thread = None
 
     def _is_loopback_connection_error(self, exception: Exception) -> bool:
         """Detects when the JMX connection is redirected to a loopback address."""
@@ -577,13 +578,11 @@ class JMXMonitor:
         logger.info("Shutting down JMX monitor...")
         self.health_check.set_ready(False)
         self._shutdown.set()
-        
-        # Wait for the discovery thread to exit
-        if getattr(self, '_discovery_thread', None):
-            self._discovery_thread.join(timeout=2.0)
-            if self._discovery_thread.is_alive():
-                logger.warning("Discovery thread did not exit within timeout")
-        
+
+        t = getattr(self, "_discovery_thread", None)
+        if t and t.is_alive():
+            t.join(timeout=2.0)
+
         # Use wait=False to avoid hanging on stuck threads during shutdown.
         # Stuck threads will be terminated when the main process exits.
         self.executor.shutdown(wait=False)
