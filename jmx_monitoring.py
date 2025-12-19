@@ -11,7 +11,7 @@ import yaml
 import sys
 import signal
 import argparse
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from dataclasses import dataclass, field
 import json
 from wsgiref.simple_server import make_server
@@ -23,10 +23,10 @@ VERSION = "1.5.1"
 _JMX_CONNECTION_SUPPORTS_TIMEOUT = 'timeout' in inspect.signature(jmxquery.JMXConnection).parameters
 
 
-def create_jmx_connection(jmx_url: str) -> jmxquery.JMXConnection:
+def create_jmx_connection(jmx_url: str, timeout: int = 10) -> jmxquery.JMXConnection:
     """Create a JMXConnection while gracefully handling timeout support."""
     if _JMX_CONNECTION_SUPPORTS_TIMEOUT:
-        return jmxquery.JMXConnection(jmx_url, timeout=10)
+        return jmxquery.JMXConnection(jmx_url, timeout=timeout)
     logger.debug("jmxquery.JMXConnection does not support timeout parameter; creating connection without it.")
     return jmxquery.JMXConnection(jmx_url)
 
@@ -297,6 +297,128 @@ class HealthCheck:
         start_response(status, headers)
         return [response]
 
+# --- JMX Connection Cache ---
+class JMXConnectionCache:
+    """
+    Thread-safe cache for JMX connections with TTL + max-size eviction.
+
+    IMPORTANT:
+    - Never hold the lock while doing slow operations (creating connections, closing connections).
+    - Uses double-checked insertion to avoid duplicate connections under concurrency.
+    """
+
+    def __init__(self):
+        self.max_size = int(os.getenv('JMX_CONN_CACHE_MAX_SIZE', '50'))
+        self.ttl_seconds = int(os.getenv('JMX_CONN_CACHE_TTL_SECONDS', '120'))
+        self._lock = threading.Lock()
+        # jmx_url -> (conn, last_used)
+        self._cache: Dict[str, Tuple[object, float]] = {}
+
+    def _safe_close(self, conn) -> None:
+        try:
+            close_fn = getattr(conn, "close", None)
+            if callable(close_fn):
+                close_fn()
+        except Exception:
+            logger.debug("Ignoring exception while closing JMX connection", exc_info=True)
+
+    def _is_expired(self, last_used: float, now: float) -> bool:
+        return (now - last_used) > self.ttl_seconds
+
+    def _evict_one_locked(self) -> Optional[object]:
+        """Evict one entry (LRU by last_used). Must be called with lock held.
+        Returns the evicted connection object (to close outside the lock) or None.
+        """
+        if not self._cache:
+            return None
+        oldest_key = min(self._cache.items(), key=lambda kv: kv[1][1])[0]
+        conn, _ = self._cache.pop(oldest_key)
+        return conn
+
+    def get(self, jmx_url: str, connect_timeout: int = 10):
+        now = time.time()
+
+        # Fast path: try return cached conn without doing slow work
+        with self._lock:
+            entry = self._cache.get(jmx_url)
+            if entry is not None:
+                conn, last_used = entry
+                if not self._is_expired(last_used, now):
+                    self._cache[jmx_url] = (conn, now)
+                    return conn
+                # expired: remove from cache; close outside lock
+                self._cache.pop(jmx_url, None)
+                expired_conn = conn
+            else:
+                expired_conn = None
+
+        # Close expired outside lock
+        if expired_conn is not None:
+            self._safe_close(expired_conn)
+
+        # Create connection outside lock (slow / may hang)
+        new_conn = create_jmx_connection(jmx_url, timeout=connect_timeout)
+
+        # Insert with double-check
+        with self._lock:
+            now2 = time.time()
+            entry2 = self._cache.get(jmx_url)
+            if entry2 is not None:
+                conn2, last_used2 = entry2
+                if not self._is_expired(last_used2, now2):
+                    # Someone else created it while we were connecting
+                    self._cache[jmx_url] = (conn2, now2)
+                    # Close the redundant connection we created
+                    redundant = new_conn
+                    new_conn = None
+                    conn_to_return = conn2
+                else:
+                    # Existing is expired; remove and replace
+                    self._cache.pop(jmx_url, None)
+                    conn_to_return = None
+                    redundant = conn2
+            else:
+                conn_to_return = None
+                redundant = None
+
+            # Close any redundant/expired existing outside lock later
+            to_close = []
+            if redundant is not None:
+                to_close.append(redundant)
+
+            if new_conn is not None:
+                # ensure space
+                while len(self._cache) >= self.max_size:
+                    evicted = self._evict_one_locked()
+                    if evicted is None:
+                        break
+                    to_close.append(evicted)
+
+                self._cache[jmx_url] = (new_conn, now2)
+                conn_to_return = new_conn
+
+        # Close evicted/replaced connections outside lock
+        for c in to_close:
+            self._safe_close(c)
+
+        return conn_to_return
+
+    def invalidate(self, jmx_url: str) -> None:
+        """Remove a single connection from cache and close it (close happens outside lock)."""
+        with self._lock:
+            entry = self._cache.pop(jmx_url, None)
+        if entry is not None:
+            conn, _ = entry
+            self._safe_close(conn)
+
+    def close_all(self) -> None:
+        """Close all connections without holding the lock during close()."""
+        with self._lock:
+            conns = [conn for (conn, _) in self._cache.values()]
+            self._cache.clear()
+        for c in conns:
+            self._safe_close(c)
+
 # --- Core JMX Monitoring Logic ---
 class JMXMonitor:
     def __init__(self, config: Config, metrics_manager: MetricsManager, internal_metrics: Any, health_check: HealthCheck):
@@ -314,6 +436,7 @@ class JMXMonitor:
         self._timeout_threshold = 3
         self._skip_cooldown = 60
         self._discovery_thread = None
+        self._jmx_cache = JMXConnectionCache()
 
     def _is_loopback_connection_error(self, exception: Exception) -> bool:
         """Detects when the JMX connection is redirected to a loopback address."""
@@ -322,6 +445,10 @@ class JMXMonitor:
             return False
         message_lower = message.lower()
         return 'connection refused' in message_lower and '127.0.0.1' in message
+
+    def _build_jmx_url(self, ip: str) -> str:
+        """Build JMX URL for a given IP."""
+        return f"service:jmx:rmi:///jndi/rmi://{ip}:{self.config.jmx_port}/jmxrmi"
 
     def _classify_exception(self, exception: Exception) -> str:
         message = str(exception).lower()
@@ -352,7 +479,7 @@ class JMXMonitor:
             jmx_url = f"service:jmx:rmi:///jndi/rmi://{ip}:{self.config.jmx_port}/jmxrmi"
             connect_start = time.time()
             try:
-                jmx_conn = create_jmx_connection(jmx_url)
+                jmx_conn = self._jmx_cache.get(jmx_url)
             except Exception as e:
                 connect_duration = time.time() - connect_start
                 self.internal_metrics.node_connect_duration_seconds.labels(ip=ip).observe(connect_duration)
@@ -444,19 +571,29 @@ class JMXMonitor:
                 for future in not_done:
                     ip = future_to_node[future]
                     logger.warning(f"Scrape for node {ip} timed out after {budget}s")
-                    if not future.cancel():
+                    jmx_url = self._build_jmx_url(ip)
+                    self._jmx_cache.invalidate(jmx_url)
+
+                    cancelled = future.cancel()
+                    if not cancelled:
                         logger.warning(f"Failed to cancel future for node {ip} (task already running)")
                         self.internal_metrics.cancel_failed_total.labels(ip=ip).inc()
+                        # Immediately open cooldown/skip for this node
+                        with self._lock:
+                            self._node_consecutive_timeouts[ip] = self._timeout_threshold
+                            self._node_skip_until[ip] = time.time() + self._skip_cooldown
+                            logger.error(f"Node {ip} severe timeout (cancel failed). Skipping for {self._skip_cooldown}s.")
+                    else:
+                        # Normal timeout, increment consecutive
+                        with self._lock:
+                            self._node_consecutive_timeouts[ip] = self._node_consecutive_timeouts.get(ip, 0) + 1
+                            if self._node_consecutive_timeouts[ip] >= self._timeout_threshold:
+                                self._node_skip_until[ip] = time.time() + self._skip_cooldown
+                                logger.error(f"Node {ip} reached {self._timeout_threshold} consecutive timeouts. Skipping for {self._skip_cooldown}s.")
 
                     self._record_node_error(ip, error_type='timeout')
                     # Record a duration for the timed out node to ensure metrics are consistent
                     self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(budget)
-
-                    with self._lock:
-                        self._node_consecutive_timeouts[ip] = self._node_consecutive_timeouts.get(ip, 0) + 1
-                        if self._node_consecutive_timeouts[ip] >= self._timeout_threshold:
-                            self._node_skip_until[ip] = time.time() + self._skip_cooldown
-                            logger.error(f"Node {ip} reached {self._timeout_threshold} consecutive timeouts. Skipping for {self._skip_cooldown}s.")
 
             except Exception as e:
                 logger.error(f"Error during scrape cycle execution: {e}")
@@ -582,6 +719,9 @@ class JMXMonitor:
         t = getattr(self, "_discovery_thread", None)
         if t and t.is_alive():
             t.join(timeout=2.0)
+
+        # Close all cached JMX connections
+        self._jmx_cache.close_all()
 
         # Use wait=False to avoid hanging on stuck threads during shutdown.
         # Stuck threads will be terminated when the main process exits.
