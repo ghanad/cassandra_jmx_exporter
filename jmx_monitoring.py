@@ -536,9 +536,10 @@ class JMXMonitor:
                         self.cluster_node_list = current_nodes
                         self.internal_metrics.nodes_discovered.set(len(current_nodes))
             except Exception as e:
-                logger.error(f"Error in node discovery loop: {e}")
+                if not self._shutdown.is_set():
+                    logger.error(f"Error in node discovery loop: {e}")
             
-            time.sleep(self.config.scan_new_nodes_interval)
+            self._shutdown.wait(self.config.scan_new_nodes_interval)
 
     def start(self):
         """Starts the monitoring service."""
@@ -560,8 +561,8 @@ class JMXMonitor:
             self.metrics_manager.get_or_create_metric(name, f"JMX: {item['objectName']} - {item['attribute']}")
 
         # Start node discovery in a separate thread
-        discovery_thread = threading.Thread(target=self._update_node_list, daemon=True, name='node-discovery')
-        discovery_thread.start()
+        self._discovery_thread = threading.Thread(target=self._update_node_list, daemon=True, name='node-discovery')
+        self._discovery_thread.start()
         
         self.health_check.set_ready(True)
         logger.info("Service is ready.")
@@ -576,6 +577,13 @@ class JMXMonitor:
         logger.info("Shutting down JMX monitor...")
         self.health_check.set_ready(False)
         self._shutdown.set()
+        
+        # Wait for the discovery thread to exit
+        if getattr(self, '_discovery_thread', None):
+            self._discovery_thread.join(timeout=2.0)
+            if self._discovery_thread.is_alive():
+                logger.warning("Discovery thread did not exit within timeout")
+        
         # Use wait=False to avoid hanging on stuck threads during shutdown.
         # Stuck threads will be terminated when the main process exits.
         self.executor.shutdown(wait=False)
