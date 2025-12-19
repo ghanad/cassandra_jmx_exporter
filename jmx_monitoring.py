@@ -114,6 +114,20 @@ class InternalMetrics:
             'Unix timestamp of the last successful scrape per node.',
             ['ip']
         )
+        self.node_skipped_total = Counter(
+            'jmx_exporter_nodes_skipped_total',
+            'Total number of times a node was skipped due to repeated timeouts.',
+            ['ip', 'reason']
+        )
+        self.cancel_failed_total = Counter(
+            'jmx_exporter_cancel_failed_total',
+            'Total number of times a future cancel failed (task already running).',
+            ['ip']
+        )
+        self.nodes_scheduled = Gauge(
+            'jmx_exporter_nodes_scheduled',
+            'Number of nodes scheduled for scraping in the current cycle.',
+        )
 
 class NoOpMetric:
     """A mock metric class that performs no operations."""
@@ -141,6 +155,9 @@ class NoOpMetrics:
         self.node_query_duration_seconds = noop
         self.node_samples_emitted = noop
         self.node_last_success_timestamp_seconds = noop
+        self.node_skipped_total = noop
+        self.cancel_failed_total = noop
+        self.nodes_scheduled = noop
 
 
 # --- Configuration Management ---
@@ -292,6 +309,10 @@ class JMXMonitor:
         self._lock = threading.Lock()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.config.max_workers)
         self._local_jmx_warning_logged = False
+        self._node_consecutive_timeouts: Dict[str, int] = {}
+        self._node_skip_until: Dict[str, float] = {}
+        self._timeout_threshold = 3
+        self._skip_cooldown = 60
 
     def _is_loopback_connection_error(self, exception: Exception) -> bool:
         """Detects when the JMX connection is redirected to a loopback address."""
@@ -367,6 +388,8 @@ class JMXMonitor:
 
             self.internal_metrics.node_samples_emitted.labels(ip=ip).set(sample_count)
             self.internal_metrics.node_last_success_timestamp_seconds.labels(ip=ip).set(time.time())
+            with self._lock:
+                self._node_consecutive_timeouts[ip] = 0
             logger.debug(f"Successfully collected metrics from {ip}")
         except Exception as e:
             logger.error(f"Error collecting metrics from {ip}: {e}")
@@ -376,41 +399,66 @@ class JMXMonitor:
         """
         Executes one full scrape cycle across all known nodes using the thread pool.
         """
-        logger.info(f"Starting scrape cycle for {len(self.cluster_node_list)} nodes...")
         start_time = time.time()
+        self.internal_metrics.scrapes_in_progress.set(1)
 
-        with self._lock:
-            nodes_to_scrape = list(self.cluster_node_list)
-
-        # Submit collection tasks to the thread pool
-        self.internal_metrics.scrapes_in_progress.set(len(nodes_to_scrape))
-        future_to_node = {self.executor.submit(self._collect_from_single_node, ip): ip for ip in nodes_to_scrape}
-        
-        # Calculate timeout budget: scrape_duration minus a small margin to allow for overhead
-        budget = max(0.0, self.config.scrape_duration - 0.5)
-        
         try:
-            done, not_done = concurrent.futures.wait(
-                future_to_node, 
-                timeout=budget, 
-                return_when=concurrent.futures.ALL_COMPLETED
-            )
-            
-            for future in done:
-                ip = future_to_node[future]
-                try:
-                    future.result()
-                except Exception as e:
-                    # Exceptions are already logged and recorded in _collect_from_single_node
-                    logger.debug(f"Future for node {ip} raised an exception: {e}")
+            with self._lock:
+                all_nodes = list(self.cluster_node_list)
+                
+            nodes_to_scrape = []
+            for ip in all_nodes:
+                with self._lock:
+                    skip_until = self._node_skip_until.get(ip, 0)
+                    if time.time() < skip_until:
+                        logger.warning(f"Skipping node {ip} due to repeated timeouts (cooldown active)")
+                        self.internal_metrics.node_skipped_total.labels(ip=ip, reason='timeout').inc()
+                        continue
+                    nodes_to_scrape.append(ip)
 
-            for future in not_done:
-                ip = future_to_node[future]
-                logger.warning(f"Scrape for node {ip} timed out after {budget}s")
-                future.cancel()
-                self._record_node_error(ip, error_type='timeout')
-                # Record a duration for the timed out node to ensure metrics are consistent
-                self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(budget)
+            logger.info(f"Starting scrape cycle for {len(nodes_to_scrape)} nodes (out of {len(all_nodes)} discovered)...")
+            self.internal_metrics.nodes_scheduled.set(len(nodes_to_scrape))
+
+            # Submit collection tasks to the thread pool
+            future_to_node = {self.executor.submit(self._collect_from_single_node, ip): ip for ip in nodes_to_scrape}
+            
+            # Calculate timeout budget: scrape_duration minus a small margin to allow for overhead
+            budget = max(0.0, self.config.scrape_duration - 0.5)
+            
+            try:
+                done, not_done = concurrent.futures.wait(
+                    future_to_node, 
+                    timeout=budget, 
+                    return_when=concurrent.futures.ALL_COMPLETED
+                )
+                
+                for future in done:
+                    ip = future_to_node[future]
+                    try:
+                        future.result()
+                    except Exception as e:
+                        # Exceptions are already logged and recorded in _collect_from_single_node
+                        logger.debug(f"Future for node {ip} raised an exception: {e}")
+
+                for future in not_done:
+                    ip = future_to_node[future]
+                    logger.warning(f"Scrape for node {ip} timed out after {budget}s")
+                    if not future.cancel():
+                        logger.warning(f"Failed to cancel future for node {ip} (task already running)")
+                        self.internal_metrics.cancel_failed_total.labels(ip=ip).inc()
+
+                    self._record_node_error(ip, error_type='timeout')
+                    # Record a duration for the timed out node to ensure metrics are consistent
+                    self.internal_metrics.node_query_duration_seconds.labels(ip=ip).observe(budget)
+
+                    with self._lock:
+                        self._node_consecutive_timeouts[ip] = self._node_consecutive_timeouts.get(ip, 0) + 1
+                        if self._node_consecutive_timeouts[ip] >= self._timeout_threshold:
+                            self._node_skip_until[ip] = time.time() + self._skip_cooldown
+                            logger.error(f"Node {ip} reached {self._timeout_threshold} consecutive timeouts. Skipping for {self._skip_cooldown}s.")
+
+            except Exception as e:
+                logger.error(f"Error during scrape cycle execution: {e}")
 
         finally:
             self.internal_metrics.scrapes_in_progress.set(0)
