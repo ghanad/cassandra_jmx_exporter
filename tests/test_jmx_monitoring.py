@@ -248,6 +248,13 @@ class JMXMonitorTimeoutTests(unittest.TestCase):
         self.mock_node_query_duration = mock.Mock()
         self.internal_metrics.node_query_duration_seconds.labels.return_value = self.mock_node_query_duration
         
+        self.mock_node_skipped = mock.Mock()
+        self.internal_metrics.node_skipped_total.labels.return_value = self.mock_node_skipped
+
+        self.mock_cancel_failed = mock.Mock()
+        self.internal_metrics.cancel_failed_total.labels.return_value = self.mock_cancel_failed
+
+        self.internal_metrics.nodes_scheduled = mock.Mock()
         self.internal_metrics.scrapes_in_progress = mock.Mock()
         self.internal_metrics.scrape_duration_seconds = mock.Mock()
         self.internal_metrics.scrapes_total = mock.Mock()
@@ -279,6 +286,73 @@ class JMXMonitorTimeoutTests(unittest.TestCase):
         self.internal_metrics.node_timeouts_total.labels.assert_any_call(ip='10.0.0.2')
         self.mock_node_timeouts.inc.assert_called()
 
+    def test_cancel_failure_handling(self):
+        """Test that cancel failure is recorded when a future cannot be cancelled."""
+        # We need to mock the executor to return a future that fails to cancel
+        mock_future = mock.Mock()
+        mock_future.cancel.return_value = False  # Cancel failed
+        mock_future.result.side_effect = Exception("Should not be called")
+        
+        # Create a mock executor
+        mock_executor = mock.Mock()
+        mock_executor.submit.return_value = mock_future
+        
+        # Replace the monitor's executor
+        self.monitor.executor = mock_executor
+        
+        # Mock wait to return the future as not_done
+        with mock.patch('concurrent.futures.wait', return_value=([], [mock_future])):
+            self.monitor._run_scrape_cycle()
+            
+        # Verify cancel was called
+        mock_future.cancel.assert_called()
+        # Verify cancel failure metric was incremented
+        self.internal_metrics.cancel_failed_total.labels.assert_called()
+        self.mock_cancel_failed.inc.assert_called()
+
+    def test_skip_mechanism(self):
+        """Test that a node is skipped after N consecutive timeouts."""
+        self.monitor._timeout_threshold = 2
+        self.monitor._skip_cooldown = 60
+        
+        # 1st timeout
+        m_future1 = mock.Mock()
+        m_future2 = mock.Mock()
+        m_future1.cancel.return_value = True
+        m_future2.cancel.return_value = True
+        
+        # We need to mock submit to return different futures for different nodes
+        def mock_submit(fn, ip):
+            if ip == '10.0.0.1': return m_future1
+            return m_future2
+
+        # We need to mock wait to return our futures in not_done
+        with mock.patch('concurrent.futures.wait', return_value=([], [m_future1, m_future2])):
+            with mock.patch.object(self.monitor.executor, 'submit', side_effect=mock_submit):
+                self.monitor._run_scrape_cycle()
+        
+        self.assertEqual(self.monitor._node_consecutive_timeouts['10.0.0.1'], 1)
+        self.assertEqual(self.monitor._node_consecutive_timeouts['10.0.0.2'], 1)
+        
+        # 2nd timeout -> should trigger skip
+        with mock.patch('concurrent.futures.wait', return_value=([], [m_future1, m_future2])):
+            with mock.patch.object(self.monitor.executor, 'submit', side_effect=mock_submit):
+                self.monitor._run_scrape_cycle()
+
+        self.assertEqual(self.monitor._node_consecutive_timeouts['10.0.0.1'], 2)
+        self.assertIn('10.0.0.1', self.monitor._node_skip_until)
+        self.assertGreater(self.monitor._node_skip_until['10.0.0.1'], time.time())
+
+        # 3rd cycle -> should skip
+        with mock.patch.object(self.monitor.executor, 'submit') as mock_submit_call:
+            self.monitor._run_scrape_cycle()
+            # Should not have been called because nodes are skipped
+            mock_submit_call.assert_not_called()
+            
+        # Verify skip metric
+        self.internal_metrics.node_skipped_total.labels.assert_any_call(ip='10.0.0.1', reason='timeout')
+        self.mock_node_skipped.inc.assert_called()
+
     def test_other_nodes_still_succeed_when_one_hangs(self):
         """Test that other nodes still complete their scrapes even if one hangs."""
         success_nodes = []
@@ -304,8 +378,18 @@ class JMXMonitorTimeoutTests(unittest.TestCase):
         with mock.patch.object(self.monitor, '_collect_from_single_node', side_effect=mock_collect):
             self.monitor._run_scrape_cycle()
 
-        # Should be set to 0 at the end
+        # Should be set to 1 at start and 0 at the end
+        self.internal_metrics.scrapes_in_progress.set.assert_any_call(1)
         self.internal_metrics.scrapes_in_progress.set.assert_called_with(0)
+
+    def test_nodes_scheduled_metric(self):
+        """Test that nodes_scheduled metric is set correctly."""
+        self.monitor.cluster_node_list = ['10.0.0.1', '10.0.0.2', '10.0.0.3']
+        
+        with mock.patch.object(self.monitor, '_collect_from_single_node'):
+            self.monitor._run_scrape_cycle()
+            
+        self.internal_metrics.nodes_scheduled.set.assert_called_with(3)
 
 
 if __name__ == '__main__':
