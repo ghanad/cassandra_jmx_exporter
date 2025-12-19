@@ -2,6 +2,7 @@ import os
 import tempfile
 import types
 import unittest
+import time
 from unittest import mock
 
 import yaml
@@ -218,6 +219,93 @@ class JMXMonitorTests(unittest.TestCase):
 
         matching_logs = [entry for entry in captured_logs.output if 'LOCAL_JMX' in entry]
         self.assertEqual(len(matching_logs), 1)
+
+
+class JMXMonitorTimeoutTests(unittest.TestCase):
+    def setUp(self):
+        self.config = Config(
+            jmx_items={'m1': {'objectName': 'obj', 'attribute': 'attr'}},
+            cluster_endpoints=['10.0.0.1'],
+            scrape_duration=1,  # Short duration for testing
+            port=9095,
+            scan_new_nodes_interval=120,
+            jmx_port=7199,
+            max_workers=5
+        )
+        self.metrics_manager = mock.Mock()
+        self.internal_metrics = mock.Mock()
+        
+        # Setup mock metrics with labels
+        self.mock_node_scrape_errors = mock.Mock()
+        self.internal_metrics.node_scrape_errors_total.labels.return_value = self.mock_node_scrape_errors
+        
+        self.mock_node_errors = mock.Mock()
+        self.internal_metrics.node_errors_total.labels.return_value = self.mock_node_errors
+        
+        self.mock_node_timeouts = mock.Mock()
+        self.internal_metrics.node_timeouts_total.labels.return_value = self.mock_node_timeouts
+        
+        self.mock_node_query_duration = mock.Mock()
+        self.internal_metrics.node_query_duration_seconds.labels.return_value = self.mock_node_query_duration
+        
+        self.internal_metrics.scrapes_in_progress = mock.Mock()
+        self.internal_metrics.scrape_duration_seconds = mock.Mock()
+        self.internal_metrics.scrapes_total = mock.Mock()
+        
+        self.health_check = mock.Mock()
+        self.monitor = JMXMonitor(self.config, self.metrics_manager, self.internal_metrics, self.health_check)
+        self.monitor.cluster_node_list = ['10.0.0.1', '10.0.0.2']
+
+    def test_scrape_cycle_finishes_when_node_hangs(self):
+        """Test that a hanging node scrape does not block the entire cycle."""
+        def mock_collect(ip):
+            if ip == '10.0.0.2':
+                time.sleep(5)  # Hang longer than the budget
+            return
+
+        with mock.patch.object(self.monitor, '_collect_from_single_node', side_effect=mock_collect):
+            start_time = time.time()
+            self.monitor._run_scrape_cycle()
+            duration = time.time() - start_time
+
+        # Budget is scrape_duration (1) - 0.5 = 0.5s
+        # The cycle should finish shortly after 0.5s, not wait 5s
+        self.assertLess(duration, 2.0)
+        self.assertGreaterEqual(duration, 0.4)
+
+        # Verify timeout was recorded for the hanging node
+        self.internal_metrics.node_errors_total.labels.assert_any_call(ip='10.0.0.2', error_type='timeout')
+        self.mock_node_errors.inc.assert_called()
+        self.internal_metrics.node_timeouts_total.labels.assert_any_call(ip='10.0.0.2')
+        self.mock_node_timeouts.inc.assert_called()
+
+    def test_other_nodes_still_succeed_when_one_hangs(self):
+        """Test that other nodes still complete their scrapes even if one hangs."""
+        success_nodes = []
+        def mock_collect(ip):
+            if ip == '10.0.0.2':
+                time.sleep(5)
+            else:
+                success_nodes.append(ip)
+            return
+
+        with mock.patch.object(self.monitor, '_collect_from_single_node', side_effect=mock_collect):
+            self.monitor._run_scrape_cycle()
+
+        self.assertIn('10.0.0.1', success_nodes)
+        self.assertNotIn('10.0.0.2', success_nodes)
+
+    def test_scrapes_in_progress_is_reset(self):
+        """Test that scrapes_in_progress is reset even if there are timeouts."""
+        def mock_collect(ip):
+            time.sleep(2)
+            return
+
+        with mock.patch.object(self.monitor, '_collect_from_single_node', side_effect=mock_collect):
+            self.monitor._run_scrape_cycle()
+
+        # Should be set to 0 at the end
+        self.internal_metrics.scrapes_in_progress.set.assert_called_with(0)
 
 
 if __name__ == '__main__':
