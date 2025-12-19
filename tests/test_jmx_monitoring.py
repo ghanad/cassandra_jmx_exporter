@@ -9,7 +9,7 @@ from unittest import mock
 import yaml
 
 import jmx_monitoring
-from jmx_monitoring import Config, ConfigError, HealthCheck, JMXMonitor, MetricsManager
+from jmx_monitoring import Config, ConfigError, HealthCheck, JMXMonitor, MetricsManager, JMXConnectionCache
 
 
 class ConfigLoadTests(unittest.TestCase):
@@ -293,23 +293,49 @@ class JMXMonitorTimeoutTests(unittest.TestCase):
         mock_future = mock.Mock()
         mock_future.cancel.return_value = False  # Cancel failed
         mock_future.result.side_effect = Exception("Should not be called")
-        
+
         # Create a mock executor
         mock_executor = mock.Mock()
         mock_executor.submit.return_value = mock_future
-        
+
         # Replace the monitor's executor
         self.monitor.executor = mock_executor
-        
+
         # Mock wait to return the future as not_done
         with mock.patch('concurrent.futures.wait', return_value=([], [mock_future])):
-            self.monitor._run_scrape_cycle()
-            
+            with mock.patch.object(self.monitor._jmx_cache, 'invalidate') as mock_invalidate:
+                self.monitor._run_scrape_cycle()
+
         # Verify cancel was called
         mock_future.cancel.assert_called()
         # Verify cancel failure metric was incremented
         self.internal_metrics.cancel_failed_total.labels.assert_called()
         self.mock_cancel_failed.inc.assert_called()
+        # Verify cache invalidate was called for the timed out node
+        mock_invalidate.assert_called_once_with("service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi")
+        # Verify severe timeout: consecutive timeouts set to threshold and skip_until set
+        self.assertEqual(self.monitor._node_consecutive_timeouts['10.0.0.2'], 3)  # threshold
+        self.assertIn('10.0.0.2', self.monitor._node_skip_until)
+        self.assertGreater(self.monitor._node_skip_until['10.0.0.2'], time.time())
+
+    def test_timeout_invalidates_cache(self):
+        """Test that cache is invalidated for timed out nodes."""
+        mock_future = mock.Mock()
+        mock_future.cancel.return_value = True  # Cancel succeeds
+
+        mock_executor = mock.Mock()
+        mock_executor.submit.return_value = mock_future
+
+        self.monitor.executor = mock_executor
+
+        with mock.patch('concurrent.futures.wait', return_value=([], [mock_future])):
+            with mock.patch.object(self.monitor._jmx_cache, 'invalidate') as mock_invalidate:
+                self.monitor._run_scrape_cycle()
+
+        # Verify cache invalidate was called for the timed out node
+        mock_invalidate.assert_called_once_with("service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi")
+        # Since cancel succeeded, consecutive timeouts incremented normally
+        self.assertEqual(self.monitor._node_consecutive_timeouts['10.0.0.2'], 1)
 
     def test_skip_mechanism(self):
         """Test that a node is skipped after N consecutive timeouts."""
@@ -524,6 +550,211 @@ class JMXMonitorShutdownTests(unittest.TestCase):
             # We verify the thread exits cleanly
             discovery_thread.join(timeout=0.5)
             self.assertFalse(discovery_thread.is_alive())
+
+
+class JMXConnectionCacheTests(unittest.TestCase):
+    def setUp(self):
+        self.original_env = os.environ.copy()
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.original_env)
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    def test_cache_reuse_within_ttl(self, mock_create):
+        """Test A: Reuse within TTL"""
+        mock_conn1 = mock.Mock()
+        mock_conn2 = mock.Mock()
+        mock_create.side_effect = [mock_conn1, mock_conn2]
+
+        cache = JMXConnectionCache()
+        url = "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi"
+
+        # First get
+        conn1 = cache.get(url)
+        self.assertEqual(conn1, mock_conn1)
+        self.assertEqual(mock_create.call_count, 1)
+
+        # Second get within TTL
+        conn2 = cache.get(url)
+        self.assertEqual(conn2, mock_conn1)  # Same object
+        self.assertEqual(mock_create.call_count, 1)  # Not called again
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    @mock.patch('jmx_monitoring.time.time')
+    def test_cache_recreate_after_ttl_expiry(self, mock_time, mock_create):
+        """Test B: Recreate after TTL expiry"""
+        mock_time.side_effect = [100.0, 250.0, 371.0, 371.0]  # store, check (expired), store new
+        mock_conn1 = mock.Mock()
+        mock_conn2 = mock.Mock()
+        mock_create.side_effect = [mock_conn1, mock_conn2]
+
+        os.environ['JMX_CONN_CACHE_TTL_SECONDS'] = '120'
+        cache = JMXConnectionCache()
+        url = "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi"
+
+        # First get
+        conn1 = cache.get(url)
+        self.assertEqual(conn1, mock_conn1)
+
+        # Second get after TTL (371 - 250 = 121 > 120)
+        conn2 = cache.get(url)
+        self.assertEqual(conn2, mock_conn2)
+        self.assertEqual(mock_create.call_count, 2)
+        mock_conn1.close.assert_called_once()
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    def test_cache_eviction_on_max_size(self, mock_create):
+        """Test C: Eviction closes connections"""
+        mock_conns = [mock.Mock() for _ in range(3)]
+        mock_create.side_effect = mock_conns
+
+        os.environ['JMX_CONN_CACHE_MAX_SIZE'] = '2'
+        cache = JMXConnectionCache()
+
+        urls = [
+            "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi",
+            "service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi",
+            "service:jmx:rmi:///jndi/rmi://10.0.0.3:7199/jmxrmi"
+        ]
+
+        # Get first two
+        cache.get(urls[0])
+        cache.get(urls[1])
+
+        # Get third, should evict first
+        cache.get(urls[2])
+
+        self.assertEqual(mock_create.call_count, 3)
+        mock_conns[0].close.assert_called_once()  # First evicted
+        mock_conns[1].close.assert_not_called()
+        mock_conns[2].close.assert_not_called()
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    def test_shutdown_closes_all(self, mock_create):
+        """Test D: Shutdown closes all"""
+        mock_conns = [mock.Mock() for _ in range(2)]
+        mock_create.side_effect = mock_conns
+
+        cache = JMXConnectionCache()
+        urls = [
+            "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi",
+            "service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi"
+        ]
+
+        cache.get(urls[0])
+        cache.get(urls[1])
+
+        cache.close_all()
+
+        mock_conns[0].close.assert_called_once()
+        mock_conns[1].close.assert_called_once()
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    def test_lock_not_held_during_connection_creation(self, mock_create):
+        """Test A: Lock is not held during connection creation"""
+        import threading
+        import time as time_module
+
+        # Event to control when create_jmx_connection returns for url1
+        create_event = threading.Event()
+        mock_conn1 = mock.Mock()
+        mock_conn2 = mock.Mock()
+        def create_side_effect(url, **kwargs):
+            if '10.0.0.1' in url:
+                create_event.wait()  # Block for url1
+                return mock_conn1
+            else:
+                return mock_conn2  # Immediate for url2
+
+        mock_create.side_effect = create_side_effect
+
+        cache = JMXConnectionCache()
+        url1 = "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi"
+        url2 = "service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi"
+
+        # Start first get in a thread, it will block in create_jmx_connection
+        result = [None]
+        def thread1():
+            result[0] = cache.get(url1)
+        t1 = threading.Thread(target=thread1)
+        t1.start()
+
+        # Wait a bit for it to start creating
+        time_module.sleep(0.1)
+
+        # Now try to get another URL; should not block on lock
+        start_time = time_module.time()
+        conn2 = cache.get(url2)  # This should proceed quickly since lock is not held
+        elapsed = time_module.time() - start_time
+        self.assertLess(elapsed, 0.5)  # Should not take long
+        self.assertEqual(conn2, mock_conn2)
+
+        # Now release the first create
+        create_event.set()
+        t1.join(timeout=1.0)
+        self.assertEqual(result[0], mock_conn1)
+
+    @mock.patch('jmx_monitoring.create_jmx_connection')
+    def test_close_all_does_not_hold_lock_while_closing(self, mock_create):
+        """Test B: close_all does not hold lock while closing"""
+        import threading
+        import time as time_module
+
+        close_event = threading.Event()
+        mock_conns = [mock.Mock() for _ in range(2)]
+        # Make close block until event is set
+        for conn in mock_conns:
+            conn.close.side_effect = lambda: close_event.wait()
+
+        mock_create.side_effect = mock_conns
+
+        cache = JMXConnectionCache()
+        urls = [
+            "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi",
+            "service:jmx:rmi:///jndi/rmi://10.0.0.2:7199/jmxrmi"
+        ]
+
+        cache.get(urls[0])
+        cache.get(urls[1])
+
+        # Start close_all in thread
+        def close_thread():
+            cache.close_all()
+        t = threading.Thread(target=close_thread)
+        t.start()
+
+        # Wait a bit, then try to get something; should not block
+        time_module.sleep(0.1)
+        start_time = time_module.time()
+        # This should proceed since lock is not held during close
+        # But since cache is cleared, it will try to create new
+        mock_create.side_effect = [mock.Mock()]  # For the new get
+        conn = cache.get(urls[0])
+        elapsed = time_module.time() - start_time
+        self.assertLess(elapsed, 0.5)
+
+        # Release close
+        close_event.set()
+        t.join(timeout=1.0)
+
+    def test_invalidate_removes_and_closes_connection(self):
+        """Test invalidate removes and closes cached connection"""
+        cache = JMXConnectionCache()
+        url = "service:jmx:rmi:///jndi/rmi://10.0.0.1:7199/jmxrmi"
+        mock_conn = mock.Mock()
+
+        # Manually add to cache
+        with cache._lock:
+            cache._cache[url] = (mock_conn, time.time())
+
+        cache.invalidate(url)
+
+        # Should be removed
+        with cache._lock:
+            self.assertNotIn(url, cache._cache)
+        # Should be closed
+        mock_conn.close.assert_called_once()
 
 
 if __name__ == '__main__':
