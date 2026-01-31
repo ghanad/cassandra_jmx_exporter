@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: your-repo/jmx-cassandra-exporter
+  repository: alig1/cassandra-jmx-exporter
   pullPolicy: IfNotPresent
   # Overrides the image tag whose default is the chart appVersion.
   tag: ""
