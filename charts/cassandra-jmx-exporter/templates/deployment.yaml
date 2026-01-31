@@ -16,9 +16,16 @@ spec:
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      {{- with .Values.podAnnotations }}
+      {{- $hasConfig := and .Values.config.create (not .Values.config.existingConfigMap) -}}
+      {{- $podAnnotations := .Values.podAnnotations -}}
+      {{- if or $hasConfig $podAnnotations }}
       annotations:
+        {{- if $hasConfig }}
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        {{- end }}
+        {{- with $podAnnotations }}
         {{- toYaml . | nindent 8 }}
+        {{- end }}
       {{- end }}
     spec:
       serviceAccountName: {{ include "cassandra-jmx-exporter.serviceAccountName" . }}
